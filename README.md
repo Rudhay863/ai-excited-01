@@ -25,6 +25,15 @@ byte-identical.
 mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 ```
 
+## Verification
+
+Run it twice into two different folders and the two `entry.png` files
+are byte-identical (same SHA-256): the scene is fully deterministic,
+built only from fixed constants and a seeded PRNG. The output is a valid
+1024×1024 PNG, 319,353 bytes — inside the competition's 1 MiB limit —
+and was viewed and checked by eye before this commit: whale, ring, sun,
+spray, foam and birds all read clearly, including at small size.
+
 The program needs nothing installed: Node 22 and its standard library
 (`node:fs`, `node:path`, `node:zlib`) are all it uses, and the PNG encoder
 (CRC32 + zlib deflate) is written in the file itself.
