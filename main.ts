@@ -1,491 +1,736 @@
-// ai-excited-01 — "The Breach Through the Golden Ring"
+// ai-excited-01 — "Golden Ring Breach"
+// A humpback whale bursting vertically through a glowing golden ring at
+// sunset. The whole image is drawn procedurally, pixel by pixel, with the
+// Node standard library only (node:fs, node:zlib, node:path). No images are
+// loaded, no network is touched, nothing depends on the clock: the same
+// fixed seed always produces the same bytes.
 //
-// A Node 22 program (standard library only) that procedurally draws one
-// original image and writes it to /output/entry.png, or to
-// $MAKEFUN_OUTPUT_DIR/entry.png when that variable is set.
+// Composition (1024 x 1024, horizon at y = 648):
+//   sky    — indigo -> plum -> terracotta -> orange -> gold gradient
+//   sun    — low, bright disc sitting on the waterline, centre x = 512
+//   ring   — a golden halo floating just above the sea, tilted in perspective
+//   whale  — a dark backlit silhouette rising straight up through the ring,
+//            warm gold rim light on its sunward flank
+//   spray  — arcs of droplets thrown off the breach
+//   foam   — a white burst where the whale leaves the water
+//   sea    — teal water with a shimmering sun-reflection column
+//   birds  — a few distant birds scattered across the sky
+//   vignette — soft darkening at the corners so the eye stays on the breach
 //
-// The scene: a humpback whale breaches straight up through a ring of
-// golden light at sunset. Spray arcs off the breach, birds scatter, and a
-// deep teal sea sits under a burning-orange sky. One hero subject, bold
-// shapes, a tight palette, strong vertical momentum — the single thrilling
-// moment, drawn fresh by this code. No text appears in the image.
-//
-// Everything is deterministic: fixed constants plus a seeded PRNG. No
-// Date, no Math.random, no network, no file reads. Two runs produce
-// byte-identical PNGs.
+// Run:  mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// The program writes entry.png into MAKEFUN_OUTPUT_DIR (or /output).
 
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { deflateSync } from "node:zlib";
+import { join } from "node:path";
 
-const W = 1024;
-const H = 1024;
-const HORIZON = 648; // y of the horizon / waterline
+export const WIDTH = 1024;
+export const HEIGHT = 1024;
+export const HORIZON = 648;
 
 // ---------------------------------------------------------------------------
-// Seeded PRNG (mulberry32). Only spray droplets and the small jitter on
-// bird positions use it, so the picture never changes between runs.
+// Deterministic random numbers (mulberry32). One fixed seed drives every
+// jittered element — spray, foam, birds, reflection — so two runs are
+// byte-identical.
 // ---------------------------------------------------------------------------
-function makeRng(seed: number): () => number {
-  let s = seed >>> 0;
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
   return () => {
-    s |= 0;
-    s = (s + 0x6d2b79f5) | 0;
-    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-const rng = makeRng(0xb3eac401);
+const rng = mulberry32(0xae01c01d);
+const rand = (lo: number, hi: number): number => lo + rng() * (hi - lo);
 
 // ---------------------------------------------------------------------------
-// Small numeric helpers.
+// Colour helpers. Colours are [r, g, b] triples in 0..255.
 // ---------------------------------------------------------------------------
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}
+type RGB = [number, number, number];
+
 function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
-function smooth(edge0: number, edge1: number, x: number): number {
-  const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
-  return t * t * (3 - 2 * t);
+function mix(c1: RGB, c2: RGB, t: number): RGB {
+  return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
 }
 
-type RGB = [number, number, number];
-
-function mix(a: RGB, b: RGB, t: number): RGB {
-  return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+// A vertical gradient defined by stops: [position 0..1, colour].
+function gradientAt(stops: Array<[number, RGB]>, t: number): RGB {
+  if (t <= stops[0][0]) return stops[0][1];
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      const [p0, c0] = stops[i - 1];
+      const [p1, c1] = stops[i];
+      return mix(c0, c1, (t - p0) / (p1 - p0));
+    }
+  }
+  return stops[stops.length - 1][1];
 }
 
 // ---------------------------------------------------------------------------
-// Palette.
+// Canvas: a plain RGBA buffer with source-over blending and a few helpers.
 // ---------------------------------------------------------------------------
-const SKY_TOP: RGB = [36, 27, 77]; // indigo, top of sky
-const SKY_PLUM: RGB = [109, 42, 99];
-const SKY_TERRA: RGB = [193, 75, 74];
-const SKY_EMBER: RGB = [240, 127, 53];
-const SKY_GOLD: RGB = [255, 196, 107]; // sky, near the horizon
-const SUN_CORE: RGB = [255, 233, 168];
-const RING_GOLD: RGB = [255, 215, 106];
-const SEA_LIT: RGB = [13, 85, 96]; // sea, lit near the horizon
-const SEA_DEEP: RGB = [4, 34, 46]; // sea, deep
-const WHALE_DARK: RGB = [15, 36, 56]; // backlit body, dark side
-const WHALE_MID: RGB = [34, 66, 88]; // backlit body, lighter side
-const RIM_GOLD: RGB = [255, 179, 71]; // warm gold rim on the flanks
-const SPRAY_WHITE: RGB = [235, 246, 248];
-const BIRD_DARK: RGB = [26, 16, 48];
+class Canvas {
+  readonly w: number;
+  readonly h: number;
+  readonly px: Uint8Array; // row-major, 4 bytes per pixel
+
+  constructor(w: number, h: number) {
+    this.w = w;
+    this.h = h;
+    this.px = new Uint8Array(w * h * 4);
+    for (let i = 3; i < this.px.length; i += 4) this.px[i] = 255;
+  }
+
+  // Source-over blend of one pixel. `a` is 0..1.
+  dot(x: number, y: number, c: RGB, a: number): void {
+    const xi = Math.round(x);
+    const yi = Math.round(y);
+    if (xi < 0 || xi >= this.w || yi < 0 || yi >= this.h || a <= 0) return;
+    const o = (yi * this.w + xi) * 4;
+    const inv = 1 - a;
+    this.px[o] = c[0] * a + this.px[o] * inv;
+    this.px[o + 1] = c[1] * a + this.px[o + 1] * inv;
+    this.px[o + 2] = c[2] * a + this.px[o + 2] * inv;
+  }
+
+  // Additive glow: pushes the pixel toward white/warmth instead of covering.
+  glow(x: number, y: number, c: RGB, a: number): void {
+    const xi = Math.round(x);
+    const yi = Math.round(y);
+    if (xi < 0 || xi >= this.w || yi < 0 || yi >= this.h || a <= 0) return;
+    const o = (yi * this.w + xi) * 4;
+    this.px[o] = Math.min(255, this.px[o] + c[0] * a);
+    this.px[o + 1] = Math.min(255, this.px[o + 1] + c[1] * a);
+    this.px[o + 2] = Math.min(255, this.px[o + 2] + c[2] * a);
+  }
+
+  // Filled disc, optionally with a soft edge (falloff in pixels).
+  disc(cx: number, cy: number, r: number, c: RGB, a: number, soft = 0): void {
+    if (r <= 0) return;
+    const x0 = Math.max(0, Math.floor(cx - r - soft));
+    const x1 = Math.min(this.w - 1, Math.ceil(cx + r + soft));
+    const y0 = Math.max(0, Math.floor(cy - r - soft));
+    const y1 = Math.min(this.h - 1, Math.ceil(cy + r + soft));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const d = Math.hypot(x - cx, y - cy);
+        if (d > r + soft) continue;
+        let alpha = a;
+        if (soft > 0 && d > r) alpha = a * (1 - (d - r) / soft);
+        this.dot(x, y, c, alpha);
+      }
+    }
+  }
+
+  // Soft radial halo: brightness falls off with distance, additive.
+  halo(cx: number, cy: number, r: number, c: RGB, strength: number): void {
+    const x0 = Math.max(0, Math.floor(cx - r));
+    const x1 = Math.min(this.w - 1, Math.ceil(cx + r));
+    const y0 = Math.max(0, Math.floor(cy - r));
+    const y1 = Math.min(this.h - 1, Math.ceil(cy + r));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const d = Math.hypot(x - cx, y - cy) / r;
+        if (d >= 1) continue;
+        const fall = (1 - d) * (1 - d);
+        this.glow(x, y, c, strength * fall);
+      }
+    }
+  }
+
+  // Filled polygon via the even-odd scanline rule.
+  polygon(points: Array<[number, number]>, c: RGB, a: number): void {
+    if (points.length < 3) return;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const [, y] of points) {
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    const y0 = Math.max(0, Math.ceil(minY));
+    const y1 = Math.min(this.h - 1, Math.floor(maxY));
+    for (let y = y0; y <= y1; y++) {
+      const xs: number[] = [];
+      for (let i = 0; i < points.length; i++) {
+        const [x1, y1p] = points[i];
+        const [x2, y2p] = points[(i + 1) % points.length];
+        if ((y1p <= y && y2p > y) || (y2p <= y && y1p > y)) {
+          xs.push(x1 + ((y - y1p) / (y2p - y1p)) * (x2 - x1));
+        }
+      }
+      xs.sort((p, q) => p - q);
+      for (let k = 0; k + 1 < xs.length; k += 2) {
+        const xa = Math.max(0, Math.ceil(xs[k]));
+        const xb = Math.min(this.w - 1, Math.floor(xs[k + 1]));
+        for (let x = xa; x <= xb; x++) this.dot(x, y, c, a);
+      }
+    }
+  }
+
+  // A thick polyline drawn as a chain of discs — used for spray arcs,
+  // bird strokes and the whale's rim light.
+  stroke(points: Array<[number, number]>, width: number, c: RGB, a: number): void {
+    if (points.length < 2) return;
+    for (let i = 0; i + 1 < points.length; i++) {
+      const [x1, y1] = points[i];
+      const [x2, y2] = points[i + 1];
+      const len = Math.hypot(x2 - x1, y2 - y1);
+      const steps = Math.max(1, Math.ceil(len / (width * 0.4)));
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps;
+        this.disc(lerp(x1, x2, t), lerp(y1, y2, t), width / 2, c, a, 1);
+      }
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
-// PNG encoder, written from scratch on the standard library: CRC32 table,
-// chunk framing, zlib deflate. RGB, 8-bit. Two row-filter variants are
-// deflated and the smaller one wins; both are deterministic.
+// Catmull-Rom spline sampling: turns a few control points into a smooth
+// curve, used for the whale's body outline and the spray arcs.
+// ---------------------------------------------------------------------------
+function catmullRom(pts: Array<[number, number]>, samplesPerSpan = 10): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  const ext: Array<[number, number]> = [pts[0], ...pts, pts[pts.length - 1]];
+  for (let i = 0; i + 3 < ext.length; i++) {
+    const [x0, y0] = ext[i];
+    const [x1, y1] = ext[i + 1];
+    const [x2, y2] = ext[i + 2];
+    const [x3, y3] = ext[i + 3];
+    for (let s = 0; s < samplesPerSpan; s++) {
+      const t = s / samplesPerSpan;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      out.push([
+        0.5 * (2 * x1 + (-x0 + x2) * t + (2 * x0 - 5 * x1 + 4 * x2 - x3) * t2 + (-x0 + 3 * x1 - 3 * x2 + x3) * t3),
+        0.5 * (2 * y1 + (-y0 + y2) * t + (2 * y0 - 5 * y1 + 4 * y2 - y3) * t2 + (-y0 + 3 * y1 - 3 * y2 + y3) * t3),
+      ]);
+    }
+  }
+  out.push(pts[pts.length - 1]);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Minimal PNG encoder (zlib deflate + CRC32), written from scratch.
+// Pixels are emitted with filter type 0 (None) on every scanline.
 // ---------------------------------------------------------------------------
 const CRC_TABLE: Uint32Array = (() => {
   const table = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
     table[n] = c >>> 0;
   }
   return table;
 })();
 
-function crc32(data: Buffer): number {
+function crc32(buf: Buffer): number {
   let c = 0xffffffff;
-  for (let i = 0; i < data.length; i++) {
-    c = CRC_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8);
-  }
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
 
-function chunk(type: string, data: Buffer): Buffer {
-  const out = Buffer.alloc(12 + data.length);
-  out.writeUInt32BE(data.length, 0);
-  out.write(type, 4, "ascii");
-  data.copy(out, 8);
-  out.writeUInt32BE(crc32(out.subarray(4, 8 + data.length)), 8 + data.length);
-  return out;
+function pngChunk(type: string, data: Buffer): Buffer {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, "ascii");
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crc]);
 }
 
-function encodePng(rgb: Uint8Array, width: number, height: number): Buffer {
+function encodePng(cv: Canvas): Buffer {
   const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
+  ihdr.writeUInt32BE(cv.w, 0);
+  ihdr.writeUInt32BE(cv.h, 4);
   ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // colour type 2 = truecolour RGB
-  ihdr[10] = 0; // compression: deflate
-  ihdr[11] = 0; // filter: adaptive per row
-  ihdr[12] = 0; // no interlace
-
-  const variants: Buffer[] = [];
-  for (const filter of [0, 1]) {
-    const raw = Buffer.alloc(height * (1 + width * 3));
-    for (let y = 0; y < height; y++) {
-      const rowStart = y * (1 + width * 3);
-      raw[rowStart] = filter;
-      const srcBase = y * width * 3;
-      for (let x = 0; x < width; x++) {
-        const dst = rowStart + 1 + x * 3;
-        const s = srcBase + x * 3;
-        if (filter === 0) {
-          raw[dst] = rgb[s];
-          raw[dst + 1] = rgb[s + 1];
-          raw[dst + 2] = rgb[s + 2];
-        } else {
-          // Sub filter: store each byte minus the byte 3 places to the left.
-          const l = x === 0 ? 0 : rgb[s - 3];
-          const lg = x === 0 ? 0 : rgb[s - 2];
-          const lb = x === 0 ? 0 : rgb[s - 1];
-          raw[dst] = (rgb[s] - l) & 0xff;
-          raw[dst + 1] = (rgb[s + 1] - lg) & 0xff;
-          raw[dst + 2] = (rgb[s + 2] - lb) & 0xff;
-        }
-      }
-    }
-    variants.push(deflateSync(raw, { level: 9 }));
+  ihdr[9] = 6; // colour type 6: RGBA
+  ihdr[10] = 0; // compression
+  ihdr[11] = 0; // filter
+  ihdr[12] = 0; // interlace
+  const raw = Buffer.alloc(cv.h * (1 + cv.w * 4));
+  for (let y = 0; y < cv.h; y++) {
+    raw[y * (1 + cv.w * 4)] = 0;
+    raw.set(cv.px.subarray(y * cv.w * 4, (y + 1) * cv.w * 4), y * (1 + cv.w * 4) + 1);
   }
-  const best = variants[0].length <= variants[1].length ? variants[0] : variants[1];
-  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const idat = deflateSync(raw, { level: 9 });
   return Buffer.concat([
-    signature,
-    chunk("IHDR", ihdr),
-    chunk("IDAT", best),
-    chunk("IEND", Buffer.alloc(0)),
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", idat),
+    pngChunk("IEND", Buffer.alloc(0)),
   ]);
 }
 
 // ---------------------------------------------------------------------------
-// Pixel buffer with read/write helpers.
+// Palette
 // ---------------------------------------------------------------------------
-const frame = new Uint8Array(W * H * 3);
-
-function setPixel(x: number, y: number, c: RGB): void {
-  const i = (y * W + x) * 3;
-  frame[i] = clamp(Math.round(c[0]), 0, 255);
-  frame[i + 1] = clamp(Math.round(c[1]), 0, 255);
-  frame[i + 2] = clamp(Math.round(c[2]), 0, 255);
-}
-
-function getPixel(x: number, y: number): RGB {
-  const i = (y * W + x) * 3;
-  return [frame[i], frame[i + 1], frame[i + 2]];
-}
-
-// ---------------------------------------------------------------------------
-// Background: sunset sky above the horizon, teal sea below it.
-// ---------------------------------------------------------------------------
-function skyColour(x: number, y: number): RGB {
-  const t = y / HORIZON;
-  let c: RGB;
-  if (t < 0.35) c = mix(SKY_TOP, SKY_PLUM, t / 0.35);
-  else if (t < 0.62) c = mix(SKY_PLUM, SKY_TERRA, (t - 0.35) / 0.27);
-  else if (t < 0.85) c = mix(SKY_TERRA, SKY_EMBER, (t - 0.62) / 0.23);
-  else c = mix(SKY_EMBER, SKY_GOLD, (t - 0.85) / 0.15);
-  // Warm glow spreading out from the low sun.
-  const dx = x - 512;
-  const dy = y - 592;
-  const glow = Math.exp(-(dx * dx + dy * dy) / (2 * 270 * 270));
-  return mix(c, [255, 210, 122], glow * 0.55);
-}
-
-function seaColour(x: number, y: number): RGB {
-  const t = (y - HORIZON) / (H - HORIZON);
-  let c = mix(SEA_LIT, SEA_DEEP, Math.pow(t, 0.8));
-  // Gentle wave banding.
-  const wave = 0.028 * Math.sin(x * 0.045 + y * 0.11) + 0.02 * Math.sin(x * 0.013 - y * 0.05);
-  c = [c[0] * (1 + wave), c[1] * (1 + wave), c[2] * (1 + wave)];
-  // Warm light spilling down from the horizon.
-  c = mix(c, [255, 190, 100], 0.35 * Math.exp(-(y - HORIZON) / 55));
-  // The sun's reflection: a soft, shimmering vertical column.
-  const column = 1 - Math.abs(x - 512) / 115;
-  if (column > 0) {
-    const shimmer = 0.55 + 0.45 * Math.sin(y * 0.11 + x * 0.021);
-    const amount = column * column * shimmer * 0.42 * Math.exp(-(y - HORIZON) / 320);
-    c = mix(c, [255, 196, 110], clamp(amount, 0, 0.6));
-  }
-  return c;
-}
+const SKY_STOPS: Array<[number, RGB]> = [
+  [0.0, [22, 12, 58]], // deep indigo, zenith
+  [0.28, [58, 26, 84]], // plum
+  [0.52, [122, 45, 92]], // dusky magenta
+  [0.72, [196, 88, 58]], // terracotta
+  [0.88, [240, 138, 46]], // orange
+  [1.0, [255, 196, 77]], // gold at the horizon
+];
+const SEA_STOPS: Array<[number, RGB]> = [
+  [0.0, [16, 78, 96]], // teal at the waterline
+  [0.45, [11, 55, 74]],
+  [1.0, [5, 34, 54]], // deep water at the bottom
+];
+const SUN_CORE: RGB = [255, 224, 130];
+const SUN_GLOW: RGB = [255, 150, 58];
+// The sun sits off-centre (right of the whale) so the whale does not hide
+// it; its reflection column runs straight down from it.
+const SUN_X = 800;
+const RING_BRIGHT: RGB = [255, 220, 120];
+const RING_MID: RGB = [232, 169, 28];
+const RING_DARK: RGB = [138, 90, 16];
+const WHALE_BODY: RGB = [18, 24, 48];
+const WHALE_BELLY: RGB = [30, 38, 70];
+const RIM_GOLD: RGB = [255, 179, 71];
+const FOAM_WHITE: RGB = [255, 252, 244];
+const FOAM_CREAM: RGB = [255, 233, 196];
 
 // ---------------------------------------------------------------------------
-// The low sun and the ring of golden light. Drawn before the whale, so the
-// whale passes in front of them: the breach goes THROUGH the ring.
+// Sky: vertical gradient, then a warm wash that deepens toward the horizon.
 // ---------------------------------------------------------------------------
-const SUN = { x: 512, y: 592, r: 92 };
-const RING = { x: 512, y: 430, r: 215, band: 17 };
-
-function paintSunAndRing(): void {
+function drawSky(cv: Canvas): void {
   for (let y = 0; y < HORIZON; y++) {
-    for (let x = 0; x < W; x++) {
-      // Sun disc, soft-edged.
-      const toSun = Math.hypot(x - SUN.x, y - SUN.y);
-      if (toSun < SUN.r + 6) {
-        const edge = smooth(SUN.r + 4, SUN.r - 6, toSun);
-        setPixel(x, y, mix(getPixel(x, y), SUN_CORE, edge));
-      }
-      // Golden ring: a bright band on its circle plus a halo falloff.
-      const toRing = Math.hypot(x - RING.x, y - RING.y);
-      const off = Math.abs(toRing - RING.r);
-      if (off < RING.band + 60) {
-        const core = 1 - smooth(RING.band * 0.55, RING.band, off);
-        const halo = Math.exp(-off / 26) * 0.5;
-        const amount = clamp(core * 0.95 + halo, 0, 1);
-        setPixel(x, y, mix(getPixel(x, y), RING_GOLD, amount));
+    const c = gradientAt(SKY_STOPS, y / HORIZON);
+    for (let x = 0; x < cv.w; x++) cv.dot(x, y, c, 1);
+  }
+  // A faint horizontal band of haze just above the horizon.
+  for (let y = HORIZON - 90; y < HORIZON; y++) {
+    const t = (y - (HORIZON - 90)) / 90;
+    for (let x = 0; x < cv.w; x++) cv.dot(x, y, [255, 170, 80], 0.10 * t);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sun: a bright disc half-sunk on the waterline with a wide additive halo
+// and a few thin horizontal light streaks across the sky.
+// ---------------------------------------------------------------------------
+function drawSun(cv: Canvas): void {
+  const cx = SUN_X;
+  const cy = HORIZON - 40;
+  cv.halo(cx, cy, 330, SUN_GLOW, 0.5);
+  cv.halo(cx, cy, 180, [255, 190, 90], 0.55);
+  cv.disc(cx, cy, 52, SUN_CORE, 1, 3);
+  cv.disc(cx, cy, 38, [255, 240, 180], 1, 2);
+  // Thin light streaks radiating left and right through the haze.
+  for (let i = 0; i < 7; i++) {
+    const y = cy - 26 + i * 9;
+    const half = 300 - Math.abs(i - 3) * 38;
+    for (let x = cx - half; x <= cx + half; x++) {
+      cv.glow(x, y, [255, 190, 110], 0.10 * (1 - Math.abs(x - cx) / half));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sea: teal gradient, a darker swell band at the waterline, then the sun's
+// reflection column — a vertical band of jittered gold dashes that widen
+// and fade as they run down toward the viewer.
+// ---------------------------------------------------------------------------
+function drawSea(cv: Canvas): void {
+  for (let y = HORIZON; y < cv.h; y++) {
+    const c = gradientAt(SEA_STOPS, (y - HORIZON) / (cv.h - HORIZON));
+    for (let x = 0; x < cv.w; x++) cv.dot(x, y, c, 1);
+  }
+  // Gentle swell lines: long, low, darker arcs across the water.
+  for (let s = 0; s < 9; s++) {
+    const y = HORIZON + 26 + s * 38;
+    const amp = 5 + s * 1.6;
+    const phase = rand(0, Math.PI * 2);
+    for (let x = 0; x < cv.w; x += 2) {
+      const yy = y + Math.sin(x / 190 + phase) * amp;
+      cv.dot(x, yy, [4, 26, 44], 0.35);
+      cv.dot(x, yy + 1, [30, 110, 128], 0.22);
+    }
+  }
+  // Sun-reflection column, running down from the sun.
+  for (let y = HORIZON + 4; y < cv.h - 8; y += 3) {
+    const depth = (y - HORIZON) / (cv.h - HORIZON);
+    const halfW = 34 + depth * 150;
+    const n = Math.floor(3 + depth * 9);
+    for (let i = 0; i < n; i++) {
+      const x = SUN_X + rand(-halfW, halfW);
+      const w = rand(14, 46) * (0.6 + depth);
+      const gold: RGB = [255, 190 + Math.floor(rand(-30, 30)), 90];
+      const a = rand(0.10, 0.42) * (1 - depth * 0.45);
+      for (let dx = -w / 2; dx <= w / 2; dx++) {
+        cv.glow(x + dx, y + rand(-0.5, 0.5), gold, a * (1 - Math.abs(dx) / (w / 2)));
       }
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// The whale: a breaching humpback built from a chain of discs along a
-// curved spine (head high, tail at the water), with tail flukes and one
-// pectoral fin. A dark backlit silhouette, with a warm gold rim on both
-// flanks where the sunset catches it.
+// The golden ring. It lies almost flat, seen at a shallow angle, so on
+// screen it is a wide ellipse. Its far (upper) arc is drawn behind the
+// whale and its near (lower) arc in front of it, which is what makes the
+// whale read as passing *through* the ring.
 // ---------------------------------------------------------------------------
-const SPINE: Array<[number, number]> = [
-  [508, 702], // tail stock, at the water
-  [500, 622],
-  [492, 522],
-  [490, 432],
-  [496, 342],
-  [508, 262],
-  [520, 202],
-  [530, 158], // snout, highest point
-];
+const RING = { cx: 512, cy: 452, rx: 236, ry: 64, tilt: -0.045, thick: 17 };
 
-// Body width along the spine, tail -> belly -> head -> snout.
-const PROFILE: Array<[number, number]> = [
-  [0.0, 24],
-  [0.15, 34],
-  [0.3, 62],
-  [0.45, 78],
-  [0.6, 72],
-  [0.75, 58],
-  [0.88, 44],
-  [1.0, 20],
-];
+function ringPoint(angle: number): [number, number] {
+  const { cx, cy, rx, ry, tilt } = RING;
+  const ex = Math.cos(angle) * rx;
+  const ey = Math.sin(angle) * ry;
+  return [
+    cx + ex * Math.cos(tilt) - ey * Math.sin(tilt),
+    cy + ex * Math.sin(tilt) + ey * Math.cos(tilt),
+  ];
+}
 
-function bodyWidth(t: number): number {
-  for (let i = 0; i < PROFILE.length - 1; i++) {
-    const [t0, r0] = PROFILE[i];
-    const [t1, r1] = PROFILE[i + 1];
-    if (t >= t0 && t <= t1) return lerp(r0, r1, (t - t0) / (t1 - t0));
+// Draw one arc of the ellipse. `a0..a1` is the angle range; the top of the
+// arc catches the sun (bright) and the bottom falls into shade.
+function drawRingArc(cv: Canvas, a0: number, a1: number, front: boolean): void {
+  const steps = 260;
+  const pts: Array<[number, number]> = [];
+  for (let i = 0; i <= steps; i++) pts.push(ringPoint(a0 + ((a1 - a0) * i) / steps));
+  // Soft glow behind the metal first, then the metal itself.
+  for (let i = 0; i < pts.length; i++) {
+    const [x, y] = pts[i];
+    const sunSide = 1 - Math.abs(Math.sin((a0 + ((a1 - a0) * i) / steps) - Math.PI / 2)) * 0.4;
+    cv.disc(x, y, RING.thick * 1.5, SUN_GLOW, 0.10 * sunSide, 6);
   }
-  return PROFILE[PROFILE.length - 1][1];
-}
-
-function spinePoint(t: number): [number, number] {
-  const last = SPINE.length - 1;
-  const seg = clamp(t * last, 0, last - 0.0001);
-  const i = Math.floor(seg);
-  const f = seg - i;
-  return [lerp(SPINE[i][0], SPINE[i + 1][0], f), lerp(SPINE[i][1], SPINE[i + 1][1], f)];
-}
-
-// The disc chain, computed once (deterministic).
-type Disc = { x: number; y: number; r: number; t: number };
-const DISCS: Disc[] = [];
-for (let i = 0; i <= 60; i++) {
-  const t = i / 60;
-  const [x, y] = spinePoint(t);
-  DISCS.push({ x, y, r: bodyWidth(t), t });
-}
-
-// Signed inside-test for a rotated ellipse: <= 0 means inside.
-function ellipseTest(
-  x: number,
-  y: number,
-  cx: number,
-  cy: number,
-  rx: number,
-  ry: number,
-  rot: number,
-): number {
-  const cos = Math.cos(rot);
-  const sin = Math.sin(rot);
-  const dx = x - cx;
-  const dy = y - cy;
-  const u = (dx * cos + dy * sin) / rx;
-  const v = (-dx * sin + dy * cos) / ry;
-  return u * u + v * v - 1;
-}
-
-function paintWhale(): void {
-  for (let y = 120; y < 730; y++) {
-    for (let x = 350; x < 690; x++) {
-      // Nearest spine disc: negative distance means inside the body.
-      let nearest = Infinity;
-      let across = 0; // -1..1 across the body, for the rim light
-      for (const d of DISCS) {
-        const dist = Math.hypot(x - d.x, y - d.y) - d.r;
-        if (dist < nearest) {
-          nearest = dist;
-          across = (x - d.x) / d.r;
-        }
-      }
-      // Tail flukes: two swept lobes at the waterline.
-      const flukeL = ellipseTest(x, y, 438, 690, 72, 26, -0.32);
-      const flukeR = ellipseTest(x, y, 580, 686, 70, 24, 0.28);
-      // Pectoral fin sweeping out to the right.
-      const fin = ellipseTest(x, y, 566, 472, 60, 16, 0.6);
-      const inside = nearest <= 0 || flukeL <= 0 || flukeR <= 0 || fin <= 0;
-      if (!inside) continue;
-      // A couple of pixels of soft edge, so the outline anti-aliases.
-      const edge = Math.min(nearest, flukeL * 30, flukeR * 30, fin * 30);
-      const alpha = clamp(1 - edge / 2.5, 0, 1);
-      if (alpha <= 0) continue;
-      // Body shading: a little lighter toward the head, warm gold rim on
-      // both flanks. The rim is for the body only, never flukes or fin.
-      let c = mix(WHALE_DARK, WHALE_MID, clamp((730 - y) / 560, 0, 1) * 0.55);
-      if (nearest <= 0) {
-        const rim = smooth(0.5, 0.95, Math.abs(across));
-        c = mix(c, RIM_GOLD, rim * 0.8);
-      } else {
-        // Flukes and fin read darker, half-lost in the splash.
-        c = [c[0] * 0.62, c[1] * 0.62, c[2] * 0.68];
-      }
-      setPixel(x, y, mix(getPixel(x, y), c, alpha));
+  for (let i = 0; i < pts.length; i++) {
+    const [x, y] = pts[i];
+    const ang = a0 + ((a1 - a0) * i) / steps;
+    // Bright on the sunward (upper-left) side, dark on the far side.
+    const lit = 0.5 + 0.5 * Math.cos(ang - Math.PI * 0.85);
+    const c = mix(RING_DARK, RING_BRIGHT, Math.pow(lit, 1.4));
+    cv.disc(x, y, RING.thick / 2, c, 1, 1);
+    if (front) {
+      // A thin hot highlight along the top edge of the near arc.
+      cv.disc(x, y - RING.thick * 0.28, RING.thick * 0.16, [255, 240, 180], 0.9, 1);
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Spray, foam and birds — the motion. Every droplet position comes from
-// the seeded PRNG, so it is identical on every run.
+// The whale. A vertical humpback silhouette built from two Catmull-Rom
+// outlines (left flank and right flank) joined at the rostrum and at the
+// tail stock, plus separate tail flukes and a pectoral fin. The body is a
+// dark backlit mass; a warm rim of sunset light runs down its right flank
+// and a cooler sheen down its left.
 // ---------------------------------------------------------------------------
-type Drop = { x: number; y: number; r: number; a: number };
+const WHALE_CX = 512;
 
-function makeSpray(): Drop[] {
-  const drops: Drop[] = [];
-  // A fan of spray bursting up and out from the breach point.
-  for (let i = 0; i < 520; i++) {
-    const angle = -Math.PI / 2 + (rng() - 0.5) * 2.4; // mostly upward
-    const dist = 40 + Math.pow(rng(), 1.6) * 260;
-    const x = 508 + Math.cos(angle) * dist * 1.15;
-    const y = 655 + Math.sin(angle) * dist * 0.85;
-    if (y < 130 || y > 760) continue;
-    drops.push({ x, y, r: 1 + rng() * 3.2, a: 0.45 + rng() * 0.55 });
+function whaleOutline(): { left: Array<[number, number]>; right: Array<[number, number]> } {
+  // Control points run from the tip of the rostrum (top) down to the tail
+  // stock (bottom). x offsets are from the centre line.
+  const leftCtrl: Array<[number, number]> = [
+    [WHALE_CX, 168],
+    [WHALE_CX - 26, 196],
+    [WHALE_CX - 52, 252],
+    [WHALE_CX - 74, 330],
+    [WHALE_CX - 82, 408],
+    [WHALE_CX - 76, 486],
+    [WHALE_CX - 58, 556],
+    [WHALE_CX - 40, 612],
+    [WHALE_CX - 26, 652],
+  ];
+  const rightCtrl: Array<[number, number]> = [
+    [WHALE_CX, 168],
+    [WHALE_CX + 30, 198],
+    [WHALE_CX + 56, 256],
+    [WHALE_CX + 78, 334],
+    [WHALE_CX + 86, 412],
+    [WHALE_CX + 80, 488],
+    [WHALE_CX + 62, 558],
+    [WHALE_CX + 44, 614],
+    [WHALE_CX + 28, 652],
+  ];
+  return { left: catmullRom(leftCtrl, 12), right: catmullRom(rightCtrl, 12) };
+}
+
+function drawWhale(cv: Canvas): void {
+  const { left, right } = whaleOutline();
+  const body = [...left, ...right.slice().reverse()];
+  cv.polygon(body, WHALE_BODY, 1);
+
+  // A subtle belly sheen: a narrower, slightly lighter shape on the
+  // shadow side, so the body is not one flat slab.
+  const bellyLeft = catmullRom(
+    [
+      [WHALE_CX - 18, 250],
+      [WHALE_CX - 44, 330],
+      [WHALE_CX - 52, 420],
+      [WHALE_CX - 44, 510],
+      [WHALE_CX - 26, 590],
+    ],
+    10,
+  );
+  const bellyRight = catmullRom(
+    [
+      [WHALE_CX - 18, 250],
+      [WHALE_CX - 6, 340],
+      [WHALE_CX - 2, 430],
+      [WHALE_CX - 10, 520],
+      [WHALE_CX - 26, 590],
+    ],
+    10,
+  );
+  cv.polygon([...bellyLeft, ...bellyRight.slice().reverse()], WHALE_BELLY, 0.85);
+
+  // Throat grooves: faint vertical lines on the lower body.
+  for (let g = 0; g < 5; g++) {
+    const gx = WHALE_CX - 34 + g * 15;
+    const pts: Array<[number, number]> = [];
+    for (let y = 470; y <= 620; y += 12) {
+      pts.push([gx + Math.sin(y / 55 + g) * 4, y]);
+    }
+    cv.stroke(pts, 2.5, [8, 12, 30], 0.5);
   }
-  // Droplets streaming off the whale's flanks as it rises.
-  for (let i = 0; i < 180; i++) {
-    const t = 0.15 + rng() * 0.7;
-    const [sx, sy] = spinePoint(t);
+
+  // Tail flukes: two broad lobes spreading from the tail stock, half
+  // buried in the foam at the waterline.
+  const stockY = 652;
+  const flukeL = catmullRom(
+    [
+      [WHALE_CX - 22, stockY - 6],
+      [WHALE_CX - 70, stockY + 6],
+      [WHALE_CX - 132, stockY - 14],
+      [WHALE_CX - 168, stockY - 44],
+      [WHALE_CX - 128, stockY - 62],
+      [WHALE_CX - 74, stockY - 52],
+      [WHALE_CX - 34, stockY - 34],
+    ],
+    10,
+  );
+  const flukeR = catmullRom(
+    [
+      [WHALE_CX + 24, stockY - 6],
+      [WHALE_CX + 74, stockY + 8],
+      [WHALE_CX + 136, stockY - 10],
+      [WHALE_CX + 172, stockY - 40],
+      [WHALE_CX + 132, stockY - 60],
+      [WHALE_CX + 78, stockY - 52],
+      [WHALE_CX + 36, stockY - 34],
+    ],
+    10,
+  );
+  cv.polygon([...flukeL, ...flukeR.slice().reverse()], WHALE_BODY, 1);
+
+  // Pectoral fin sweeping out to the viewer's left, catching the light.
+  const fin = catmullRom(
+    [
+      [WHALE_CX - 70, 470],
+      [WHALE_CX - 128, 512],
+      [WHALE_CX - 176, 566],
+      [WHALE_CX - 196, 616],
+      [WHALE_CX - 158, 600],
+      [WHALE_CX - 112, 552],
+      [WHALE_CX - 80, 508],
+    ],
+    10,
+  );
+  cv.polygon(fin, [15, 20, 42], 1);
+  // A sliver of rim light along the fin's lower edge.
+  cv.stroke(
+    catmullRom(
+      [
+        [WHALE_CX - 128, 512],
+        [WHALE_CX - 176, 566],
+        [WHALE_CX - 196, 616],
+      ],
+      8,
+    ),
+    3,
+    RIM_GOLD,
+    0.75,
+  );
+
+  // Rim light: the sunset edge on the whale's right flank, brightest near
+  // the ring and fading toward the rostrum and the tail.
+  const rim = right.slice(4, -3);
+  for (let i = 0; i < rim.length; i++) {
+    const [x, y] = rim[i];
+    const t = i / (rim.length - 1);
+    const strength = 0.35 + 0.6 * Math.sin(t * Math.PI);
+    cv.disc(x + 1, y, 4.5, RIM_GOLD, strength * 0.55, 3);
+    cv.disc(x + 1, y, 2, [255, 220, 140], strength * 0.8, 1);
+  }
+  // A cooler, fainter edge on the left flank.
+  const rimL = left.slice(6, -4);
+  for (let i = 0; i < rimL.length; i++) {
+    const [x, y] = rimL[i];
+    cv.disc(x - 1, y, 2.5, [120, 130, 200], 0.35, 2);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Spray: arcs of droplets thrown off the breach, plus a soft mist halo
+// around the rostrum. Droplets are small discs with a bright core; the
+// mist is many large, very faint discs.
+// ---------------------------------------------------------------------------
+function drawSpray(cv: Canvas): void {
+  // Mist around the head.
+  for (let i = 0; i < 55; i++) {
+    const ang = rand(0, Math.PI * 2);
+    const r = rand(10, 110);
+    const x = WHALE_CX + Math.cos(ang) * r * 1.15;
+    const y = 210 + Math.sin(ang) * r * 0.8 - r * 0.25;
+    cv.disc(x, y, rand(8, 24), [255, 240, 220], rand(0.03, 0.09), 8);
+  }
+  // Droplet arcs: several parabolic streams fanning out from the body.
+  const streams: Array<{ x0: number; y0: number; vx: number; vy: number; n: number }> = [
+    { x0: 470, y0: 300, vx: -3.4, vy: -7.5, n: 26 },
+    { x0: 560, y0: 330, vx: 3.8, vy: -7.0, n: 26 },
+    { x0: 448, y0: 420, vx: -4.6, vy: -5.2, n: 22 },
+    { x0: 580, y0: 440, vx: 4.9, vy: -4.6, n: 22 },
+    { x0: 512, y0: 190, vx: 0.6, vy: -8.6, n: 18 },
+    { x0: 512, y0: 190, vx: -1.2, vy: -8.2, n: 14 },
+  ];
+  for (const s of streams) {
+    for (let i = 0; i < s.n; i++) {
+      const t = i / s.n;
+      const x = s.x0 + s.vx * i * 6 + rand(-6, 6);
+      const y = s.y0 + s.vy * i * 6 + 0.42 * i * i + rand(-5, 5);
+      const size = rand(1.5, 4.5) * (1 - t * 0.45);
+      const alpha = rand(0.5, 0.95) * (1 - t * 0.35);
+      cv.disc(x, y, size, FOAM_WHITE, alpha, 1);
+      cv.disc(x - size * 0.25, y - size * 0.25, size * 0.45, [255, 255, 255], alpha, 0.5);
+    }
+  }
+  // A few lone droplets flung wide.
+  for (let i = 0; i < 22; i++) {
     const side = rng() < 0.5 ? -1 : 1;
-    const x = sx + side * (bodyWidth(t) + 4 + rng() * 34);
-    const y = sy + (rng() - 0.5) * 26;
-    drops.push({ x, y, r: 0.8 + rng() * 2.2, a: 0.4 + rng() * 0.5 });
+    const x = WHALE_CX + side * rand(120, 300);
+    const y = rand(200, 480);
+    cv.disc(x, y, rand(1.5, 3.5), FOAM_WHITE, rand(0.4, 0.85), 1);
   }
-  return drops;
 }
 
-function paintDrops(drops: Drop[]): void {
-  for (const d of drops) {
-    const r = Math.ceil(d.r) + 1;
-    for (let y = Math.floor(d.y - r); y <= Math.ceil(d.y + r); y++) {
-      for (let x = Math.floor(d.x - r); x <= Math.ceil(d.x + r); x++) {
-        if (x < 0 || x >= W || y < 0 || y >= H) continue;
-        const dist = Math.hypot(x + 0.5 - d.x, y + 0.5 - d.y);
-        if (dist >= d.r) continue;
-        const a = d.a * (1 - smooth(d.r * 0.4, d.r, dist));
-        setPixel(x, y, mix(getPixel(x, y), SPRAY_WHITE, a));
+// ---------------------------------------------------------------------------
+// Foam burst: a ring of white peaks and bubbles where the whale leaves the
+// water, with a few long streaks of foam running outward on the surface.
+// ---------------------------------------------------------------------------
+function drawFoam(cv: Canvas): void {
+  const cy = HORIZON + 6;
+  // Long foam streaks on the water first (behind the burst).
+  for (let i = 0; i < 26; i++) {
+    const side = rng() < 0.5 ? -1 : 1;
+    const x0 = WHALE_CX + side * rand(90, 160);
+    const len = rand(60, 190);
+    const y = cy + rand(2, 22);
+    for (let x = 0; x < len; x++) {
+      cv.dot(x0 + side * x, y + Math.sin(x / 22) * 1.5, FOAM_CREAM, rand(0.25, 0.6));
+    }
+  }
+  // The burst itself: overlapping discs, tallest at the centre.
+  for (let i = 0; i < 240; i++) {
+    const ang = rand(-Math.PI, 0); // upper half only
+    const r = rand(0, 150);
+    const x = WHALE_CX + Math.cos(ang) * r * 1.25;
+    const y = cy - Math.abs(Math.sin(ang)) * r * 0.55 - rand(0, 26) * (1 - r / 170);
+    const size = rand(6, 30) * (1 - Math.abs(x - WHALE_CX) / 260);
+    const c = rng() < 0.6 ? FOAM_WHITE : FOAM_CREAM;
+    cv.disc(x, y, Math.max(3, size), c, rand(0.55, 0.95), 4);
+  }
+  // Sharp foam peaks poking upward around the body.
+  for (let i = 0; i < 34; i++) {
+    const x = WHALE_CX + rand(-150, 150);
+    const h = rand(14, 64) * (1 - Math.abs(x - WHALE_CX) / 200);
+    const tip: [number, number] = [x, cy - h];
+    const baseL: [number, number] = [x - rand(8, 18), cy + 2];
+    const baseR: [number, number] = [x + rand(8, 18), cy + 2];
+    cv.polygon([tip, baseL, baseR], FOAM_WHITE, rand(0.75, 0.95));
+  }
+  // Bubbles scattered on the surface.
+  for (let i = 0; i < 60; i++) {
+    const x = WHALE_CX + rand(-190, 190);
+    const y = cy + rand(4, 34);
+    cv.disc(x, y, rand(1.5, 5), FOAM_WHITE, rand(0.3, 0.7), 1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Birds: a few small distant birds, each two short strokes meeting at a
+// point, scattered high in the sky and scaled by distance.
+// ---------------------------------------------------------------------------
+function drawBirds(cv: Canvas): void {
+  const flock: Array<[number, number, number]> = [
+    [180, 170, 1.0],
+    [228, 196, 0.8],
+    [150, 232, 0.65],
+    [820, 150, 1.0],
+    [872, 186, 0.75],
+    [786, 214, 0.6],
+    [700, 260, 0.55],
+    [330, 120, 0.7],
+    [640, 110, 0.6],
+  ];
+  for (const [x, y, s] of flock) {
+    const span = 16 * s;
+    const lift = 7 * s;
+    cv.stroke(
+      [
+        [x - span, y - lift],
+        [x, y],
+        [x + span, y - lift],
+      ],
+      2.4 * s,
+      [26, 16, 44],
+      0.85,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vignette: gentle darkening toward the corners so the eye stays on the
+// breach and the ring.
+// ---------------------------------------------------------------------------
+function drawVignette(cv: Canvas): void {
+  const cx = WIDTH / 2;
+  const cy = HEIGHT / 2;
+  const maxD = Math.hypot(cx, cy);
+  for (let y = 0; y < cv.h; y++) {
+    for (let x = 0; x < cv.w; x++) {
+      const d = Math.hypot(x - cx, y - cy) / maxD;
+      if (d > 0.62) {
+        cv.dot(x, y, [8, 6, 24], (d - 0.62) * 0.55);
       }
     }
   }
 }
 
-// White foam bursting where the whale leaves the water, plus a rolling
-// foam ring spreading on the surface around the breach.
-function paintFoam(): void {
-  for (let y = 624; y < 700; y++) {
-    for (let x = 330; x < 700; x++) {
-      const burst = Math.exp(
-        -(Math.pow((x - 508) / 125, 2) + Math.pow((y - 656) / 22, 2)),
-      );
-      const ring = Math.exp(
-        -Math.pow((Math.hypot((x - 508) / 168, (y - 652) / 24) - 1) * 3.0, 2),
-      );
-      const chop = 0.8 + 0.2 * Math.sin(x * 0.09 + Math.sin(y * 0.3) * 0.8);
-      // Fade the foam out toward its left/right ends so it never reads
-      // as a rectangular slab.
-      const fade = 1 - smooth(0.55, 1, Math.abs(x - 508) / 185);
-      const a = clamp((burst * 0.8 + ring * 0.5) * chop * fade, 0, 0.9);
-      if (a > 0.02) setPixel(x, y, mix(getPixel(x, y), SPRAY_WHITE, a));
-    }
-  }
-}
-
-// Small scattering birds, drawn as dark chevrons — they sell the scale.
-const BIRDS: Array<{ x: number; y: number; s: number }> = [
-  { x: 178, y: 182, s: 13 },
-  { x: 252, y: 138, s: 10 },
-  { x: 332, y: 232, s: 12 },
-  { x: 700, y: 168, s: 13 },
-  { x: 772, y: 242, s: 11 },
-  { x: 834, y: 148, s: 9 },
-  { x: 148, y: 332, s: 10 },
-  { x: 862, y: 332, s: 12 },
-  { x: 640, y: 108, s: 9 },
-];
-
-function paintBirds(): void {
-  for (const b of BIRDS) {
-    const cx = b.x + (rng() - 0.5) * 6;
-    const cy = b.y + (rng() - 0.5) * 6;
-    const s = b.s;
-    // Two short strokes meeting at the body: a swept "v".
-    for (let i = 0; i <= 20; i++) {
-      const t = i / 20;
-      const lx = Math.round(cx - t * s);
-      const ly = Math.round(cy - t * s * 0.42);
-      const rx = Math.round(cx + t * s);
-      const ry = Math.round(cy - t * s * 0.42);
-      for (const [px, py] of [
-        [lx, ly],
-        [rx, ry],
-        [lx, ly + 1],
-        [rx, ry + 1],
-      ]) {
-        if (px >= 0 && px < W && py >= 0 && py < H) setPixel(px, py, BIRD_DARK);
-      }
-    }
-  }
-}
-
-// A gentle vignette so the eye stays on the centre.
-function paintVignette(): void {
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const d = Math.hypot((x - 512) / 512, (y - 470) / 512);
-      const v = 1 - 0.16 * smooth(0.62, 1.05, d);
-      const c = getPixel(x, y);
-      setPixel(x, y, [c[0] * v, c[1] * v, c[2] * v]);
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Render and write. Output goes to $MAKEFUN_OUTPUT_DIR/entry.png, or to
-// /output/entry.png inside the grader's container.
+// Compose and write the image.
 // ---------------------------------------------------------------------------
+function render(): Canvas {
+  const cv = new Canvas(WIDTH, HEIGHT);
+  drawSky(cv);
+  drawSun(cv);
+  drawBirds(cv);
+  // The sea comes before the whale: the whale rises out of it, and the
+  // waterline cuts the sun's lower half so the sun sits on the water.
+  drawSea(cv);
+  // Far arc of the ring, behind the whale.
+  drawRingArc(cv, Math.PI, Math.PI * 2, false);
+  drawWhale(cv);
+  // Near arc of the ring, in front of the whale's lower body.
+  drawRingArc(cv, 0, Math.PI, true);
+  drawSpray(cv);
+  // Foam last (after the sea) so the burst stays the brightest thing at
+  // the waterline, half-burying the tail flukes.
+  drawFoam(cv);
+  drawVignette(cv);
+  return cv;
+}
+
 function main(): void {
   const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      setPixel(x, y, y < HORIZON ? skyColour(x, y) : seaColour(x, y));
-    }
-  }
-  paintSunAndRing();
-  paintWhale();
-  paintFoam();
-  paintDrops(makeSpray());
-  paintBirds();
-  paintVignette();
-  const png = encodePng(frame, W, H);
   mkdirSync(outDir, { recursive: true });
+  const png = encodePng(render());
   writeFileSync(join(outDir, "entry.png"), png);
-  console.log(`wrote ${join(outDir, "entry.png")} (${png.length} bytes)`);
 }
 
 main();
