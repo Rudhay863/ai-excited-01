@@ -1,4 +1,7 @@
+# Local build output and tooling noise — never committed.
 out/
 node_modules/
 *.log
 .DS_Store
+# Test-run output folders.
+tmp-run*/
